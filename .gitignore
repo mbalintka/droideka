@@ -1,0 +1,9 @@
+# Python virtuális környezet (Ezt SOHA nem töltjük fel)
+slam_env/
+
+# Python gyorsítótár fájlok
+__pycache__/
+*.pyc
+
+# VS Code specifikus beállítások (ha nem akarod megosztani)
+.vscode/
