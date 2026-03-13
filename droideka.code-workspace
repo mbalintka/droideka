@@ -1,7 +1,12 @@
 {
 	"folders": [
 		{
-			"path": "."
+			"name": "NANO-KLIENS",
+			"path": "nano_client"
+		},
+		{
+			"name": "GPU-SZERVER",
+			"path": "gpu_server"
 		}
 	],
 	"settings": {
