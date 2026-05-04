@@ -1,9 +1,108 @@
 # Python virtuális környezet (Ezt SOHA nem töltjük fel)
 slam_env/
+venv/
+.venv/
+env/
+.env/
 
 # Python gyorsítótár fájlok
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
 
 # VS Code specifikus beállítások (ha nem akarod megosztani)
 .vscode/
+
+# Local secrets / machine-specific config
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+
+# Logs / runtime artifacts
+*.log
+logs/
+log/
+tmp/
+temp/
+
+# Python packaging/build outputs
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / IDE
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Large binary artifacts (keep repo slim) ----
+
+# RealSense recordings
+*.bag
+
+# Images / video dumps (recordings, debug)
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.tiff
+
+# Point clouds / meshes (Open3D / reconstruction exports)
+*.ply
+*.pcd
+*.obj
+*.stl
+*.glb
+*.gltf
+
+# Numpy / serialized dumps
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# ML checkpoints / weights (DROID-SLAM / Torch)
+*.pt
+*.pth
+*.ckpt
+*.onnx
+checkpoints/
+weights/
+
+# Experiment tracking
+runs/
+wandb/
+tensorboard/
+
+# Common project output folders (client+server)
+data/
+dataset/
+datasets/
+recordings/
+captures/
+outputs/
+results/
+artifacts/
+
+# Allow keeping empty dirs in git
+!.gitkeep
