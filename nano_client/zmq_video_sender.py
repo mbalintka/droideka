@@ -54,6 +54,12 @@ def main() -> int:
         help="Video path or glob pattern for image sequence.",
     )
     parser.add_argument("--fps", type=float, default=30.0, help="Streaming FPS for image sequences.")
+    parser.add_argument(
+        "--loop",
+        action="store_true",
+        help="For glob / image-sequence sources only: repeat the sequence forever "
+        "(needed to keep SLAM fed after stop_teach during autonomy tests).",
+    )
     parser.add_argument("--jpeg-quality", type=int, default=80, help="JPEG quality (0-100).")
     parser.add_argument(
         "--resize",
@@ -87,20 +93,27 @@ def main() -> int:
                 print(f"ERROR: No images found for glob: {source}")
                 return 2
 
-            print(f"Streaming image sequence: {len(files)} frames. Stop with Ctrl+C.")
-            for file_path in files:
-                frame = cv2.imread(file_path, cv2.IMREAD_COLOR)
-                if frame is None:
-                    continue
+            mode = "looping" if args.loop else "one pass"
+            print(
+                f"Streaming image sequence: {len(files)} frames ({mode}). "
+                "Stop with Ctrl+C."
+            )
+            while True:
+                for file_path in files:
+                    frame = cv2.imread(file_path, cv2.IMREAD_COLOR)
+                    if frame is None:
+                        continue
 
-                if resize is not None:
-                    frame = cv2.resize(frame, resize)
+                    if resize is not None:
+                        frame = cv2.resize(frame, resize)
 
-                payload = _encode_jpeg(frame, quality=args.jpeg_quality)
-                socket.send(payload)
+                    payload = _encode_jpeg(frame, quality=args.jpeg_quality)
+                    socket.send(payload)
 
-                frame_count += 1
-                time.sleep(delay_s)
+                    frame_count += 1
+                    time.sleep(delay_s)
+                if not args.loop:
+                    break
         else:
             # Video file
             cap = cv2.VideoCapture(source)
