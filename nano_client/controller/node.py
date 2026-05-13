@@ -30,19 +30,22 @@ importable on dev machines (Windows / CI) that do not have ROS 2 installed.
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import json
 import sys
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import zmq
 
 from .config import VehicleConfig
+from .path import save_path
 from .pure_pursuit import ControlCommand, Pose, PurePursuit
+from .run_logger import RunLogger
 
 
 # ---------------------------------------------------------------------------
@@ -56,11 +59,14 @@ def request_path_from_gpu(
     min_step_m: Optional[float] = None,
     smooth_window: Optional[int] = None,
     timeout_s: float = 30.0,
-) -> np.ndarray:
+) -> tuple[np.ndarray, dict]:
     """Ask the GPU server to switch to autonomous mode and return the path.
 
     Returns:
-        (N, 3) float64 array ``[x, y, theta]`` in the SLAM world frame.
+        Tuple ``(path, meta)`` where ``path`` is an (N, 3) float64 array
+        ``[x, y, theta]`` in the SLAM world frame, and ``meta`` is the
+        path-build metadata dict from the GPU (frame, yaw convention,
+        total length, smoothing parameters, etc.).
     """
     payload: dict = {"cmd": "stop_teach"}
     if min_step_m is not None:
@@ -113,7 +119,7 @@ def request_path_from_gpu(
         f"[autonomy] received path: {shape[0]} waypoints, "
         f"length={meta.get('total_length_m', float('nan')):.2f} m"
     )
-    return path
+    return path, meta
 
 
 # ---------------------------------------------------------------------------
@@ -128,9 +134,19 @@ class _LatestPose:
 
 
 class PoseSubscriber:
-    """Background ZMQ SUB that keeps the most recent pose under a lock."""
+    """Background ZMQ SUB that keeps the most recent pose under a lock.
 
-    def __init__(self, gpu_host: str, pose_port: int):
+    Optional ``on_pose`` callback fires on every successfully-parsed pose, on
+    the subscriber thread. Used to feed the run logger without smuggling it
+    into network code.
+    """
+
+    def __init__(
+        self,
+        gpu_host: str,
+        pose_port: int,
+        on_pose: Optional[Callable[[Pose, int], None]] = None,
+    ):
         self._endpoint = f"tcp://{gpu_host}:{pose_port}"
         self._lock = threading.Lock()
         self._latest = _LatestPose(pose=None, t_recv_ns=0)
@@ -138,6 +154,7 @@ class PoseSubscriber:
         self._thread: Optional[threading.Thread] = None
         self._ctx = zmq.Context.instance()
         self._sock: Optional[zmq.Socket] = None
+        self._on_pose = on_pose
 
     def start(self) -> None:
         self._sock = self._ctx.socket(zmq.SUB)
@@ -171,8 +188,18 @@ class PoseSubscriber:
                 print(f"[autonomy] bad pose message dropped: {e}")
                 continue
 
+            t_recv_ns = time.time_ns()
             with self._lock:
-                self._latest = _LatestPose(pose=pose, t_recv_ns=time.time_ns())
+                self._latest = _LatestPose(pose=pose, t_recv_ns=t_recv_ns)
+
+            cb = self._on_pose
+            if cb is not None:
+                # Cross-thread call; the logger handles its own locking. Swallow
+                # exceptions so a bad callback can never kill the SUB thread.
+                try:
+                    cb(pose, t_recv_ns)
+                except Exception as cb_err:
+                    print(f"[autonomy] on_pose callback raised: {cb_err}")
 
     def snapshot(self) -> _LatestPose:
         with self._lock:
@@ -217,7 +244,74 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=30.0,
         help="ZMQ timeout for the initial stop_teach request.",
     )
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory to persist this run's artefacts (taught path, meta, "
+            "telemetry JSONL). Defaults to nano_client/runs/<YYYYMMDD_HHMMSS>/ "
+            "next to this module."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def _default_run_dir() -> Path:
+    """Return ``nano_client/runs/<YYYYMMDD_HHMMSS>/`` next to this package."""
+    pkg_root = Path(__file__).resolve().parent.parent
+    stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return pkg_root / "runs" / stamp
+
+
+def _prepare_run_dir(
+    run_dir: Optional[Path],
+    cfg: VehicleConfig,
+    args: argparse.Namespace,
+) -> Path:
+    """Create the run directory if it doesn't exist and write a placeholder
+    ``meta.json`` so the operator can see the run is live before stop_teach
+    completes (``meta.json`` is overwritten with the full record once the path
+    arrives).
+    """
+    run_dir = (run_dir or _default_run_dir()).resolve()
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    placeholder = {
+        "status": "starting",
+        "started_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        "gpu_host": args.gpu_host,
+        "pose_port": int(args.pose_port),
+        "cmd_port": int(args.cmd_port),
+        "rate_hz": float(args.rate_hz),
+        "cfg": cfg.to_dict(),
+    }
+    with (run_dir / "meta.json").open("w", encoding="utf-8") as fh:
+        json.dump(placeholder, fh, indent=2)
+    return run_dir
+
+
+def _write_run_meta(
+    run_dir: Path,
+    cfg: VehicleConfig,
+    args: argparse.Namespace,
+    path_meta: dict,
+    path_file: Path,
+) -> None:
+    """Overwrite ``meta.json`` with the full record once we have the path."""
+    record = {
+        "status": "armed",
+        "started_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        "gpu_host": args.gpu_host,
+        "pose_port": int(args.pose_port),
+        "cmd_port": int(args.cmd_port),
+        "rate_hz": float(args.rate_hz),
+        "cfg": cfg.to_dict(),
+        "path_file": str(path_file.name),
+        "path_meta": path_meta,
+    }
+    with (run_dir / "meta.json").open("w", encoding="utf-8") as fh:
+        json.dump(record, fh, indent=2)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -230,17 +324,40 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     print(f"[autonomy] vehicle config: {cfg.to_dict()}")
 
+    run_dir = _prepare_run_dir(args.run_dir, cfg, args)
+    print(f"[autonomy] run artefacts -> {run_dir}")
+
     print(
         f"[autonomy] requesting stop_teach from "
         f"tcp://{args.gpu_host}:{args.cmd_port} ..."
     )
-    path = request_path_from_gpu(
+    path, path_meta = request_path_from_gpu(
         gpu_host=args.gpu_host,
         cmd_port=args.cmd_port,
         timeout_s=args.cmd_timeout_s,
     )
 
-    sub = PoseSubscriber(gpu_host=args.gpu_host, pose_port=args.pose_port)
+    path_file = save_path(run_dir / "path_taught.npy", path)
+    _write_run_meta(run_dir, cfg, args, path_meta, path_file)
+    print(f"[autonomy] taught path saved -> {path_file}")
+
+    logger = RunLogger(run_dir)
+    logger.log_start(
+        cfg_dict=cfg.to_dict(),
+        path_meta=path_meta,
+        n_waypoints=int(path.shape[0]),
+        gpu_host=args.gpu_host,
+        pose_port=int(args.pose_port),
+        cmd_port=int(args.cmd_port),
+        rate_hz=float(args.rate_hz),
+    )
+    print(f"[autonomy] telemetry log -> {logger.path}")
+
+    sub = PoseSubscriber(
+        gpu_host=args.gpu_host,
+        pose_port=args.pose_port,
+        on_pose=logger.log_pose,
+    )
     sub.start()
     print(
         f"[autonomy] pose subscriber connected to "
@@ -279,11 +396,17 @@ def main(argv: Optional[list[str]] = None) -> int:
             now_ns = time.time_ns()
             if snap.pose is None:
                 self._publish_zero()
+                logger.log_event("pose_unavailable")
                 return
 
             age_s = (now_ns - snap.t_recv_ns) / 1e9
             if age_s > cfg.pose_timeout_s:
                 self._publish_zero()
+                logger.log_event(
+                    "pose_stale",
+                    pose_age_s=float(age_s),
+                    pose_timeout_s=float(cfg.pose_timeout_s),
+                )
                 self.get_logger().warn(
                     f"pose stale ({age_s:.2f}s > {cfg.pose_timeout_s:.2f}s) -> zero Twist",
                     throttle_duration_sec=1.0,
@@ -297,9 +420,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             twist.angular.z = float(cmd.delta)
             self.pub.publish(twist)
 
+            logger.log_tick(snap.pose, cmd, pose_age_s=float(age_s))
+
             if cmd.done:
                 self._done_latched = True
                 self._publish_zero()
+                logger.log_event(
+                    "goal_reached",
+                    dist_to_goal_m=float(cmd.distance_to_goal),
+                )
                 self.get_logger().info(
                     f"Goal reached (distance_to_goal={cmd.distance_to_goal:.3f} m); "
                     "publishing zero Twist."
@@ -308,11 +437,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     rclpy.init()
     node = AutonomyNode()
     exit_code = 0
+    shutdown_reason = "completed"
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
+        shutdown_reason = "interrupted"
         node.get_logger().info("Interrupted; sending stop Twist.")
     except Exception as e:
+        shutdown_reason = "error"
+        logger.log_event("error", message=str(e))
         node.get_logger().error(f"unexpected error: {e}")
         exit_code = 1
     finally:
@@ -330,6 +463,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             except Exception:
                 pass
         sub.stop()
+        logger.finalize(shutdown_reason)
 
     return exit_code
 

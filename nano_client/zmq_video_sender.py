@@ -60,7 +60,12 @@ def main() -> int:
         help="For glob / image-sequence sources only: repeat the sequence forever "
         "(needed to keep SLAM fed after stop_teach during autonomy tests).",
     )
-    parser.add_argument("--jpeg-quality", type=int, default=80, help="JPEG quality (0-100).")
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=95,
+        help="JPEG quality (0-100, default: 95).",
+    )
     parser.add_argument(
         "--resize",
         default="960x288",

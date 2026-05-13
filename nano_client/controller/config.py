@@ -18,7 +18,8 @@ from typing import Union
 class VehicleConfig:
     # --- Vehicle geometry ---
     # Distance between front and rear axles (kinematic bicycle wheelbase).
-    wheelbase: float = 0.30
+    # 0.32 m matches the HPI Trophy Buggy Flux (#107016) factory spec.
+    wheelbase: float = 0.32
 
     # Hard limit on steering angle commanded to the servo.
     max_steer_rad: float = math.radians(30.0)

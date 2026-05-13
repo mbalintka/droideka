@@ -38,6 +38,8 @@ class ControlCommand:
     done: bool        # True once the goal tolerance has been reached
     target_xy: np.ndarray  # the lookahead point in world frame (debug/log)
     distance_to_goal: float
+    seg_idx: int = -1            # closest-segment index on the path (debug/log)
+    cross_track_m: float = 0.0   # perpendicular distance to the path (debug/log)
 
 
 class PurePursuit:
@@ -84,13 +86,15 @@ class PurePursuit:
                 distance_to_goal=float(
                     np.linalg.norm(np.array([pose.x, pose.y]) - path[-1, :2])
                 ),
+                seg_idx=self._last_seg_idx,
+                cross_track_m=0.0,
             )
 
         v_cmd = cfg.target_v
         ld = self._lookahead_for(v_cmd)
 
         pose_xy = np.array([pose.x, pose.y], dtype=np.float64)
-        target_xy, seg_idx, dist_to_goal = find_lookahead_point(
+        target_xy, seg_idx, dist_to_goal, cross_track_m = find_lookahead_point(
             pose_xy, path, lookahead=ld, last_idx=self._last_seg_idx
         )
         self._last_seg_idx = seg_idx
@@ -101,6 +105,7 @@ class PurePursuit:
             return ControlCommand(
                 v=0.0, delta=0.0, done=True,
                 target_xy=target_xy, distance_to_goal=dist_to_goal,
+                seg_idx=seg_idx, cross_track_m=cross_track_m,
             )
 
         # Vector from rear axle (~vehicle origin) to lookahead point, expressed
@@ -120,6 +125,7 @@ class PurePursuit:
             return ControlCommand(
                 v=v_cmd, delta=0.0, done=False,
                 target_xy=target_xy, distance_to_goal=dist_to_goal,
+                seg_idx=seg_idx, cross_track_m=cross_track_m,
             )
 
         # Pure Pursuit curvature: kappa = 2 * y_local / Ld^2
@@ -138,4 +144,5 @@ class PurePursuit:
         return ControlCommand(
             v=v_cmd, delta=delta, done=False,
             target_xy=target_xy, distance_to_goal=dist_to_goal,
+            seg_idx=seg_idx, cross_track_m=cross_track_m,
         )

@@ -9,7 +9,7 @@ Public surface:
     - save_path(out, points) -> Path
     - arc_length_resample(points, spacing) -> np.ndarray
     - find_lookahead_point(pose, path, lookahead, last_idx=0)
-        -> (target_xy, segment_idx, distance_to_goal)
+        -> (target_xy, segment_idx, distance_to_goal, cross_track_m)
 """
 
 from __future__ import annotations
@@ -106,7 +106,7 @@ def find_lookahead_point(
     path: np.ndarray,
     lookahead: float,
     last_idx: int = 0,
-) -> Tuple[np.ndarray, int, float]:
+) -> Tuple[np.ndarray, int, float, float]:
     """Find the lookahead target on `path`.
 
     Strategy:
@@ -132,6 +132,9 @@ def find_lookahead_point(
                           monotonic lower-bound for the next call.
         distance_to_goal: straight-line distance from pose to the final
                           waypoint of the path (used by the goal-reached check).
+        cross_track_m:    perpendicular distance from the pose to the closest
+                          point on the path (the cross-track error, useful for
+                          telemetry / quality scoring of a run).
     """
     pose_xy = np.asarray(pose_xy, dtype=np.float64).reshape(2)
     xy = path[:, :2]
@@ -149,6 +152,8 @@ def find_lookahead_point(
             best_d2 = d2
             best_pt = cp
             best_seg = i
+
+    cross_track_m = float(np.sqrt(best_d2))
 
     # ---- 2) walk forward by `lookahead` ----
     remaining = float(lookahead)
@@ -173,4 +178,4 @@ def find_lookahead_point(
         target = xy[-1].copy()
 
     distance_to_goal = float(np.linalg.norm(pose_xy - xy[-1]))
-    return target, best_seg, distance_to_goal
+    return target, best_seg, distance_to_goal, cross_track_m
