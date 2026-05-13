@@ -255,17 +255,24 @@ def main():
 
             if cmd_sock in events:
                 try:
-                    raw = cmd_sock.recv(flags=zmq.NOBLOCK)
+                    cmd_parts = cmd_sock.recv_multipart(flags=zmq.NOBLOCK)
                 except zmq.Again:
-                    raw = None
+                    cmd_parts = None
 
-                if raw is not None:
+                if cmd_parts:
+                    # REQ sends a leading delimiter frame; take the last part as JSON body.
+                    raw = cmd_parts[-1] if cmd_parts else b""
                     try:
                         payload = json.loads(raw.decode("utf-8")) if raw else {}
                     except json.JSONDecodeError:
                         payload = {}
                     cmd = str(payload.get("cmd", "")).strip().lower()
                     print(f"[cmd] received: {payload}")
+
+                    # REP -> REQ replies must start with an empty delimiter frame or the
+                    # client's REQ socket never completes recv (times out with EAGAIN).
+                    def _cmd_reply(meta_bytes: bytes, body: bytes) -> None:
+                        cmd_sock.send_multipart([b"", meta_bytes, body])
 
                     if cmd == "stop_teach":
                         try:
@@ -275,11 +282,9 @@ def main():
                                 args.min_step_m,
                                 args.smooth_window,
                             )
-                            cmd_sock.send_multipart(
-                                [
-                                    json.dumps(meta).encode("utf-8"),
-                                    path_xyz_theta.tobytes(order="C"),
-                                ]
+                            _cmd_reply(
+                                json.dumps(meta).encode("utf-8"),
+                                path_xyz_theta.tobytes(order="C"),
                             )
                             state = "AUTONOMOUS"
                             print(
@@ -288,27 +293,21 @@ def main():
                             )
                         except Exception as e:
                             err = {"ok": False, "error": str(e)}
-                            cmd_sock.send_multipart(
-                                [json.dumps(err).encode("utf-8"), b""]
-                            )
+                            _cmd_reply(json.dumps(err).encode("utf-8"), b"")
                             print(f"[cmd] stop_teach failed: {e}")
                     elif cmd == "ping":
-                        cmd_sock.send_multipart(
-                            [
-                                json.dumps(
-                                    {"ok": True, "state": state, "frames": frame_id}
-                                ).encode("utf-8"),
-                                b"",
-                            ]
+                        _cmd_reply(
+                            json.dumps(
+                                {"ok": True, "state": state, "frames": frame_id}
+                            ).encode("utf-8"),
+                            b"",
                         )
                     else:
-                        cmd_sock.send_multipart(
-                            [
-                                json.dumps(
-                                    {"ok": False, "error": f"unknown cmd: {cmd!r}"}
-                                ).encode("utf-8"),
-                                b"",
-                            ]
+                        _cmd_reply(
+                            json.dumps(
+                                {"ok": False, "error": f"unknown cmd: {cmd!r}"}
+                            ).encode("utf-8"),
+                            b"",
                         )
 
             if frames_sock in events:

@@ -75,9 +75,16 @@ def request_path_from_gpu(
     sock.setsockopt(zmq.SNDTIMEO, int(timeout_s * 1000))
     sock.connect(f"tcp://{gpu_host}:{cmd_port}")
 
+    frames: list[bytes] = []
     try:
         sock.send_string(json.dumps(payload))
         frames = sock.recv_multipart()
+    except zmq.Again as e:
+        raise RuntimeError(
+            f"No reply from GPU on tcp://{gpu_host}:{cmd_port} within {timeout_s}s. "
+            "Is live_slam running there, and is port open (same checks as frames :5555)? "
+            "If the server was updated recently, restart live_slam so REQ/REP framing matches."
+        ) from e
     finally:
         sock.close(linger=0)
 
