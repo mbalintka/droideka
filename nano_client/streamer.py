@@ -3,22 +3,22 @@ import zmq
 import time
 
 def start_streaming(camera_index=2, port=5555):
-    # 1. ZeroMQ hálózat beállítása (Publisher - Kiadó mód)
+    # 1. ZeroMQ network setup (publisher mode)
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
-    # A '*' jelenti, hogy a Nano minden hálózati kártyáján (Wi-Fi, LAN) kiadja az adatot
+    # '*' publishes on all interfaces (Wi-Fi, LAN)
     socket.bind(f"tcp://*:{port}")
-    print(f"📡 ZeroMQ Publisher elindítva a {port}-es porton.")
+    print(f"ZeroMQ publisher started on port {port}.")
 
-    # 2. Kamera inicializálása
+    # 2. Camera initialization
     cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
     if not cap.isOpened():
-        print(f"❌ Hiba: Nem sikerült megnyitni a(z) {camera_index}. kamerát.")
+        print(f"ERROR: Failed to open camera index {camera_index}.")
         return
 
-    print("🎥 Kamera megnyitva! Streamelés indítása... (Leállítás: Ctrl+C)")
+    print("Camera opened. Streaming started... (Stop: Ctrl+C)")
     
-    # Képkocka számláló és időzítő a sebesség (FPS) méréséhez
+    # Frame counter + timer for FPS measurement
     frame_count = 0
     start_time = time.time()
 
@@ -26,44 +26,41 @@ def start_streaming(camera_index=2, port=5555):
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("⚠️ Nem jött képkocka a kamerából!")
+                print("WARNING: No frame received from camera.")
                 time.sleep(0.1)
                 continue
 
-            # --- ELŐFELDOLGOZÁS A NANO-N ---
+            # --- PREPROCESSING ON THE NANO ---
             
-            # A) Kicsinyítés (pl. 640x480 felbontásra, ha a kamera nagyobb lenne)
-            # A DROID-SLAM-nek bőven elég ez a méret, és spórolunk a sávszélességgel.
+            # A) Downscale to reduce bandwidth (DROID-SLAM does not need full resolution).
             frame_resized = cv2.resize(frame, (640, 480))
             
-            # B) JPEG Tömörítés (Ez a varázslat!)
-            # A minőséget 80%-ra állítjuk. Ez drasztikusan csökkenti a méretet (pl. 1MB -> 40KB)
+            # B) JPEG compression to dramatically reduce payload size.
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
             success, encoded_image = cv2.imencode('.jpg', frame_resized, encode_param)
             
             if success:
-                # 3. Kép elküldése a hálózaton
-                # A tobytes() alakítja a képet olyan adathalmazzá (byte-folyammá), amit a hálózat ért is.
+                # 3. Send encoded image over the network (raw bytes payload).
                 socket.send(encoded_image.tobytes())
                 
                 frame_count += 1
                 
-                # Minden 30. képkockánál (kb. másodpercenként) kiírunk egy állapotjelentést
+                # Status line roughly once per second
                 if frame_count % 30 == 0:
                     elapsed = time.time() - start_time
                     fps = frame_count / elapsed
                     size_kb = len(encoded_image.tobytes()) / 1024
-                    print(f"Elküldve: {frame_count}. kép | FPS: {fps:.1f} | Méret: {size_kb:.1f} KB")
+                    print(f"Sent: {frame_count} frames | FPS: {fps:.1f} | Size: {size_kb:.1f} KB")
 
     except KeyboardInterrupt:
-        print("\n🛑 Streamelés leállítva a felhasználó által.")
+        print("\nStreaming stopped by user.")
     finally:
-        # Erőforrások felszabadítása a program végén
+        # Cleanup resources on exit
         cap.release()
         socket.close()
         context.term()
-        print("Kamera és hálózat lezárva.")
+        print("Camera and network closed.")
 
 if __name__ == "__main__":
-    # Ha a find_usb_camera.py korábban más indexet adott (pl. 1 vagy 2), azt itt írd át!
+    # If `find_usb_camera.py` finds another index, update it here.
     start_streaming(camera_index=2)

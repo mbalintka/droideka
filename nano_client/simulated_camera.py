@@ -3,45 +3,44 @@ import time
 import os
 
 def test_camera_headless():
-    print("Kamera tesztelése headless (kijelző nélküli) módban...\n" + "-"*40)
+    print("Testing camera in headless mode...\n" + "-" * 40)
     
-    # Próbáljuk meg a 0, 1 és 2-es indexeket (mert USB kamera Linuxon)
+    # Try indices 0, 1, 2 (typical for USB cameras on Linux)
     for index in range(3):
-        print(f"[{index}] Keresés a /dev/video{index} porton...")
+        print(f"[index={index}] Checking /dev/video{index} ...")
         
-        # V4L2 backend használata Linuxhoz
+        # Use V4L2 backend for Linux
         cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
         
         if cap.isOpened():
-            print(f"✅ Kamera hardveresen megnyitva a(z) {index}. porton!")
-            print("   Kamera bemelegítése (automatikus fényerő beállása)...")
+            print(f"Camera opened at index {index}.")
+            print("  Warming up (auto-exposure settling)...")
             
-            # Olvassunk ki 10 képkockát a "kukába", hogy a kamera fókuszálhasson / beállhasson
+            # Read a few frames to let exposure/focus settle
             for _ in range(10):
                 ret, frame = cap.read()
                 time.sleep(0.05)
             
             if ret:
                 height, width, channels = frame.shape
-                print(f"   Képfelbontás: {width}x{height} (Színcsatornák: {channels})")
+                print(f"  Resolution: {width}x{height} (Channels: {channels})")
                 
-                # Mentsük el az utolsó leolvasott képet fájlként a nano_client mappába
-                filename = f"test_kamera_kep_port_{index}.jpg"
+                # Save the last captured frame as an image file
+                filename = f"test_camera_frame_index_{index}.jpg"
                 cv2.imwrite(filename, frame)
                 
-                print(f"📸 SIKER! Tesztkép elmentve: {filename}")
-                print(f"   -> Kattints rá kétszer a VS Code bal oldali sávjában a megtekintéshez!")
+                print(f"SUCCESS: Test frame saved to: {filename}")
                 
                 cap.release()
                 return True
             else:
-                print(f"⚠️ A kamera megnyílt, de nem jött át rajta képkocka adata.")
+                print("WARNING: Camera opened, but no frame was captured.")
             
             cap.release()
         else:
-            print(f"❌ Nincs elérhető eszköz a(z) {index}. porton.")
+            print(f"No device available at index {index}.")
 
-    print("-" * 40 + "\n❌ Hiba: Nem találtunk működő kamerát. Biztosan be van dugva az USB?")
+    print("-" * 40 + "\nERROR: No working camera found. Is the USB device connected?")
     return False
 
 if __name__ == "__main__":

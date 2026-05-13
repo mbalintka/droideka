@@ -2,35 +2,37 @@ import cv2
 
 def find_working_camera():
     """
-    Végigiterál az első 3 videó indexen (0, 1, 2), hogy megtalálja a csatlakoztatott USB kamerát.
-    Linux rendszereken a cv2.CAP_V4L2 backend használata javasolt a stabilitás érdekében.
+    Iterate over the first 3 video indices (0, 1, 2) to find a working USB camera.
+    On Linux, using the cv2.CAP_V4L2 backend is recommended for stability.
     """
-    print(f"OpenCV verzió: {cv2.__version__}")
-    print("Kamera keresése indítva...\n" + "-"*30)
+    print(f"OpenCV version: {cv2.__version__}")
+    print("Searching for camera...\n" + "-" * 30)
 
-    # Próbáljuk meg a 0, 1 és 2-es indexeket
+    # Try indices 0, 1, 2
     for index in range(3):
-        print(f"[{index}. index] Próbálkozás a /dev/video{index} porton...")
+        print(f"[index={index}] Trying /dev/video{index} ...")
         
-        # A cv2.CAP_V4L2 mondja meg az OpenCV-nek, hogy Linuxos USB kamerát keresünk
+        # cv2.CAP_V4L2 tells OpenCV to use the Linux V4L2 backend
         cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
         
         if cap.isOpened():
-            # Ha sikerült megnyitni, próbáljunk meg olvasni is belőle egy képkockát
+            # If it opened, try grabbing a frame as well
             ret, frame = cap.read()
             if ret:
-                print(f"✅ SIKER! Működő kamera azonosítva a(z) {index}. indexen.")
-                print(f"   Képfelbontás: {frame.shape[1]}x{frame.shape[0]}")
+                print(f"SUCCESS: Working camera found at index {index}.")
+                print(f"  Resolution: {frame.shape[1]}x{frame.shape[0]}")
                 cap.release()
                 return index
             else:
-                print(f"⚠️ A(z) {index}. port megnyílt, de nem jön belőle kép (lehet, hogy csak virtuális eszköz).")
+                print(
+                    f"WARNING: Index {index} opened, but no frame was read (could be a virtual device)."
+                )
         else:
-            print(f"❌ Nem található eszköz a(z) {index}. porton.")
+            print(f"No device available at index {index}.")
             
         cap.release()
 
-    print("-" * 30 + "\nHiba: Nem találtunk működő kamerát. Kérlek ellenőrizd az USB kábelt!")
+    print("-" * 30 + "\nERROR: No working camera found. Check the USB connection.")
     return None
 
 if __name__ == "__main__":
