@@ -269,10 +269,12 @@ def main():
                     cmd = str(payload.get("cmd", "")).strip().lower()
                     print(f"[cmd] received: {payload}")
 
-                    # REP -> REQ replies must start with an empty delimiter frame or the
-                    # client's REQ socket never completes recv (times out with EAGAIN).
+                    # Two application frames [meta_json, payload]; pyzmq/libzmq adds the
+                    # REQ/REP delimiter on the wire — do not prepend b"" here or the Nano
+                    # REQ recv_multipart becomes [b"", meta, body] and json.loads(frames[0])
+                    # fails (and some stacks never complete the reply).
                     def _cmd_reply(meta_bytes: bytes, body: bytes) -> None:
-                        cmd_sock.send_multipart([b"", meta_bytes, body])
+                        cmd_sock.send_multipart([meta_bytes, body])
 
                     if cmd == "stop_teach":
                         try:

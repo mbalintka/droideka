@@ -88,6 +88,10 @@ def request_path_from_gpu(
     finally:
         sock.close(linger=0)
 
+    # Some pyzmq/libzmq stacks deliver [b"", meta, body] after certain REP encodings.
+    if frames and frames[0] == b"":
+        frames = frames[1:]
+
     if len(frames) < 2:
         raise RuntimeError(
             f"stop_teach reply had {len(frames)} frame(s), expected >= 2"
