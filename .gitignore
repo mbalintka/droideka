@@ -81,6 +81,9 @@ desktop.ini
 *.pkl
 *.pickle
 
+# Local DROID-SLAM checkout (install separately; do not commit embedded repo)
+gpu_server/DROID-SLAM/
+
 # ML checkpoints / weights (DROID-SLAM / Torch)
 *.pt
 *.pth
