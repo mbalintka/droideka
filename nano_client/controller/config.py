@@ -26,7 +26,10 @@ class VehicleConfig:
 
     # --- Speed schedule ---
     # Target forward velocity while following the path.
-    target_v: float = 0.6
+    # Capped at 0.3 m/s for the initial HPI Trophy Buggy Flux live tests —
+    # the chassis can go far faster, but Pure Pursuit + the SLAM pose rate
+    # are the limiting factors at this stage.
+    target_v: float = 0.3
 
     # --- Lookahead schedule ---
     # Pure Pursuit lookahead distance: Ld = clip(gain*v + min, min, max).
