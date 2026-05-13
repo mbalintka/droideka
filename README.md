@@ -278,7 +278,7 @@ Example `my_car.json`:
 {
   "wheelbase": 0.32,
   "max_steer_rad": 0.523599,
-  "target_v": 0.6,
+  "target_v": 0.3,
   "lookahead_min": 0.30,
   "lookahead_max": 1.50,
   "lookahead_gain": 0.40,
@@ -286,6 +286,9 @@ Example `my_car.json`:
   "goal_tolerance_m": 0.20
 }
 ```
+
+`target_v` defaults to `0.3 m/s` for the initial live tests — bump it via the
+JSON config once the closed-loop behaviour looks clean.
 
 Camera intrinsics for DROID-SLAM are baked into
 [`gpu_server/droideka_src/live_slam.py`](gpu_server/droideka_src/live_slam.py)
