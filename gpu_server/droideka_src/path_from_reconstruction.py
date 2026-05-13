@@ -158,6 +158,64 @@ def _recompute_yaw_from_path(positions_xz: np.ndarray) -> np.ndarray:
 # Public API
 # ---------------------------------------------------------------------------
 
+def build_path_from_poses(
+    poses_tensor: torch.Tensor,
+    min_step_m: float = 0.03,
+    smooth_window: int = 7,
+    verbose: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a cleaned 2D path directly from a DROID-SLAM poses tensor.
+
+    No disk I/O — intended for in-process use by ``live_slam.py`` when
+    switching from teach to autonomous mode.
+
+    Args:
+        poses_tensor  : (N, 7) world-to-camera SE3 7-vectors
+                        [tx, ty, tz, qx, qy, qz, qw]. CPU or CUDA.
+        min_step_m    : minimum distance between consecutive waypoints after
+                        deduplication. ~0.03 m (3 cm) works well.
+        smooth_window : box-filter kernel size for smoothing (samples).
+                        Set to 0 or 1 to skip smoothing.
+        verbose       : print progress lines.
+
+    Returns:
+        path_xy  : (N, 2) float64 — waypoints in SLAM X–Z plane.
+        path_yaw : (N,)   float64 — heading per waypoint [rad].
+    """
+    poses = torch.as_tensor(poses_tensor)
+    n_raw = int(poses.shape[0])
+    if verbose:
+        print(f"  Raw keyframes: {n_raw}")
+
+    # 1. Extract positions and headings
+    pos_xz, yaws = _extract_raw_path(poses)
+
+    # 2. Remove near-duplicate points
+    if min_step_m > 0.0:
+        pos_xz, yaws = _remove_close_duplicates(pos_xz, yaws, min_step_m)
+        if verbose:
+            print(
+                f"  After deduplication (min_step={min_step_m} m): "
+                f"{len(pos_xz)} waypoints"
+            )
+
+    # 3. Smooth the spatial coordinates
+    if smooth_window >= 2:
+        pos_xz = _smooth_path(pos_xz, smooth_window)
+        # Recompute yaw from smoothed tangents for consistency
+        yaws = _recompute_yaw_from_path(pos_xz)
+        if verbose:
+            print(f"  After smoothing (window={smooth_window}): path ready")
+
+    if len(pos_xz) < 2:
+        raise RuntimeError(
+            f"Path has only {len(pos_xz)} waypoint(s) after cleaning — "
+            "decrease min_step_m or use a longer recording."
+        )
+
+    return pos_xz.astype(np.float64), yaws.astype(np.float64)
+
+
 def build_path(
     reconstruction_path: str,
     min_step_m: float = 0.03,
@@ -165,6 +223,8 @@ def build_path(
     output_dir: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Load a DROID-SLAM .pth file and produce a cleaned 2D path.
+
+    Thin disk-I/O wrapper around :func:`build_path_from_poses`.
 
     Args:
         reconstruction_path : path to nano_live_map.pth (or similar).
@@ -183,46 +243,29 @@ def build_path(
     blob = torch.load(reconstruction_path, map_location="cpu")
 
     poses = torch.as_tensor(blob["poses"])  # (N, 7) world-to-camera
-    n_raw = poses.shape[0]
-    print(f"  Raw keyframes: {n_raw}")
 
-    # 1. Extract positions and headings
-    pos_xz, yaws = _extract_raw_path(poses)
+    pos_xz, yaws = build_path_from_poses(
+        poses,
+        min_step_m=min_step_m,
+        smooth_window=smooth_window,
+        verbose=True,
+    )
 
-    # 2. Remove near-duplicate points
-    if min_step_m > 0.0:
-        pos_xz, yaws = _remove_close_duplicates(pos_xz, yaws, min_step_m)
-        print(f"  After deduplication (min_step={min_step_m} m): {len(pos_xz)} waypoints")
-
-    # 3. Smooth the spatial coordinates
-    if smooth_window >= 2:
-        pos_xz = _smooth_path(pos_xz, smooth_window)
-        # Recompute yaw from smoothed tangents for consistency
-        yaws = _recompute_yaw_from_path(pos_xz)
-        print(f"  After smoothing (window={smooth_window}): path ready")
-
-    if len(pos_xz) < 2:
-        raise RuntimeError(
-            f"Path has only {len(pos_xz)} waypoint(s) after cleaning — "
-            "decrease min_step_m or use a longer recording."
-        )
-
-    # 4. Save outputs
     if output_dir is None:
         output_dir = os.path.dirname(os.path.abspath(reconstruction_path))
 
     path_xy_file  = os.path.join(output_dir, "path_xy.npy")
     path_yaw_file = os.path.join(output_dir, "path_yaw.npy")
 
-    np.save(path_xy_file,  pos_xz.astype(np.float64))
-    np.save(path_yaw_file, yaws.astype(np.float64))
+    np.save(path_xy_file,  pos_xz)
+    np.save(path_yaw_file, yaws)
 
     total_length = float(np.sum(np.linalg.norm(np.diff(pos_xz, axis=0), axis=1)))
     print(f"  Path length : {total_length:.2f} m  ({len(pos_xz)} waypoints)")
     print(f"  Saved path_xy  -> {path_xy_file}")
     print(f"  Saved path_yaw -> {path_yaw_file}")
 
-    return pos_xz.astype(np.float64), yaws.astype(np.float64)
+    return pos_xz, yaws
 
 
 # ---------------------------------------------------------------------------

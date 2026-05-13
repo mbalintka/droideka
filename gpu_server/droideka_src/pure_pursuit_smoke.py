@@ -1,3 +1,9 @@
+"""Offline smoke test for the GPU-side :class:`PurePursuitController`.
+
+Not part of the live autonomy loop — run from a dev shell to sanity-check
+the controller geometry against a trivial straight-line path.
+"""
+
 import math
 import os
 import sys

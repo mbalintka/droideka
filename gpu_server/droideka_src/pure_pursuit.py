@@ -1,3 +1,19 @@
+"""GPU-side Pure Pursuit utilities (offline / replay use only).
+
+The autonomous loop runs the Nano-side controller in
+``nano_client/controller/pure_pursuit.py``. This module is kept on the GPU
+side for two reasons:
+
+1. ``live_slam.py`` imports :data:`CAMERA_OFFSET_FORWARD_M` and
+   :func:`camera_pose_to_vehicle_pose` to transform SLAM camera poses into
+   rear-axle poses before they go on the wire.
+2. The :class:`PurePursuitController` class is useful for offline
+   path-tracking experiments (replay a recorded ``.pth`` against a
+   reference path without the Nano in the loop).
+
+Do not wire the :class:`PurePursuitController` into the live control loop.
+"""
+
 from __future__ import annotations
 
 import math
