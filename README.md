@@ -21,9 +21,12 @@ this repo only emits the `geometry_msgs/msg/Twist` it expects on `/cmd_vel`.
 
 - **Camera**: Intel RealSense D435i (RGB used for SLAM; depth/IMU available
   for future emergency-brake work).
-- **Vehicle**: 1/10-scale RC car, ~0.32 m wheelbase, max steering ±30°.
-  Camera mounted 200 mm behind the front axle (≈0.12 m ahead of the rear
-  axle — see `CAMERA_OFFSET_FORWARD_M` in
+- **Vehicle**: [HPI Trophy Buggy Flux #107016](https://www.hpiracing.com/en/kit/107016) —
+  1/8-scale 4WD electric buggy, 320 mm wheelbase, max steering ±30°
+  (defaults in
+  [`nano_client/controller/config.py`](nano_client/controller/config.py)
+  match these specs). Camera mounted 200 mm behind the front axle
+  (≈0.12 m ahead of the rear axle — see `CAMERA_OFFSET_FORWARD_M` in
   [`gpu_server/droideka_src/pure_pursuit.py`](gpu_server/droideka_src/pure_pursuit.py)).
 - **Compute**:
   - **Client**: Jetson Nano (camera capture, light pre-processing, ROS 2 node).
@@ -103,6 +106,7 @@ droideka/
 │   ├── streamer.py                   # USB camera -> ZMQ PUSH (teach mode)
 │   ├── zmq_video_sender.py           # Same wire format, replays KITTI / video
 │   ├── bag_streamer.py               # Same wire format, replays RealSense .bag
+│   ├── extract_bag_frames.py         # Offline: .bag -> JPEG folder (for Nano replay)
 │   ├── simulated_camera.py           # Headless camera bring-up helper
 │   ├── find_usb_camera.py            # V4L2 index discovery
 │   ├── view_map.py                   # Offline .pth -> .ply (Open3D, RGBD path)
@@ -111,7 +115,8 @@ droideka/
 │       ├── config.py                 # VehicleConfig dataclass
 │       ├── path.py                   # (N,3) path I/O + lookahead search
 │       ├── pure_pursuit.py           # PurePursuit.compute(pose, path)
-│       └── node.py                   # rclpy entrypoint -> /cmd_vel
+│       ├── run_logger.py             # Thread-safe JSONL telemetry logger
+│       └── node.py                   # rclpy entrypoint -> /cmd_vel + run dir
 ├── AGENT.md                          # Project intent (Hungarian/English)
 ├── .cursorrules                      # Engineering rules for AI assistance
 └── README.md                         # (this file)
@@ -184,6 +189,22 @@ color stream, resizes to 960×288 to match the intrinsics in `live_slam.py`,
 and pushes JPEG-encoded frames on port 5555 — identical wire format to the
 live `streamer.py`. Requires `pip install pyrealsense2` on the replay host.
 
+If the replay host cannot reach the GPU server but the Nano can, decode the
+bag once on a host that *does* have `pyrealsense2`, then replay the resulting
+JPEG folder on the Nano:
+
+```bash
+# On the host with pyrealsense2 (e.g. Windows dev box):
+python nano_client/extract_bag_frames.py --bag rec.bag --out bag_frames
+
+# Copy the folder to the Nano:
+scp -r bag_frames/ nano:~/droideka/
+
+# On the Nano (no pyrealsense2 needed — Jetson aarch64 has no wheel):
+python nano_client/zmq_video_sender.py --server-ip <gpu> \
+    --source 'bag_frames/*.jpg' --resize none --fps 30
+```
+
 **4. Switch to autonomous mode** when the SLAM trajectory looks good:
 
 ```bash
@@ -196,9 +217,39 @@ subscribes to live poses, and starts publishing `/cmd_vel` Twists. The car
 will follow the previously-traced path; at the goal the node latches a zero
 Twist and stops.
 
-**5. Shut down** with `Ctrl+C` on each process. `live_slam.py` runs a final
-bundle adjustment and saves the reconstruction to `nano_live_map.pth` next
-to itself (overridable with `--reconstruction_path`).
+Every autonomy run also writes a self-contained artefact bundle to
+`nano_client/runs/<YYYYMMDD_HHMMSS>/` (overridable with `--run-dir`):
+
+| File              | Contents                                                                            |
+|-------------------|-------------------------------------------------------------------------------------|
+| `path_taught.npy` | The `(N, 3)` `[x, y, theta]` reference path returned by `stop_teach`.               |
+| `meta.json`       | GPU build params (`total_length_m`, `min_step_m`, ...), `VehicleConfig`, CLI flags. |
+| `autonomy.jsonl`  | Telemetry: `start`, every received `pose`, every controller `tick` (with `v`, `delta`, `target_xy`, `seg_idx`, `cross_track_m`, `pose_age_s`, `dist_to_goal_m`), `pose_stale` / `pose_unavailable` events, `goal_reached`, and a final `shutdown` summary (`n_ticks`, `n_poses`, min/max pose age, `final_dist_to_goal_m`, `wall_duration_s`). |
+
+`runs/` is already covered by `.gitignore`, so the bundle stays out of source
+control by default. The JSONL is line-buffered and flushed per record, so a
+`Ctrl+C` mid-run still produces a recoverable log.
+
+**5. Shut down** with `Ctrl+C` on each process. The Nano autonomy node emits
+a final `shutdown` record into `autonomy.jsonl` before exiting.
+`live_slam.py` runs a final bundle adjustment and saves the reconstruction
+to `nano_live_map.pth` next to itself (overridable with `--reconstruction_path`).
+
+### Live-test pre-flight checklist
+
+Before arming the buggy:
+
+- GPU server is up, weights loaded; verify with a `ping`:
+  `python -c "import zmq, json; s = zmq.Context().socket(zmq.REQ); s.connect('tcp://<gpu>:5557'); s.send_string(json.dumps({'cmd':'ping'})); print(s.recv_multipart())"`
+  should reply with `state="TEACH"` and a non-zero `frames` count once the
+  stream is flowing.
+- `auto_control_ws/car_control_node` is running, subscribed to `/cmd_vel`,
+  watchdog active.
+- Streamer FPS log shows stable ≥ 20 Hz (the JPEG quality default is 95,
+  so packets are larger than the historical 80 — confirm the link keeps up).
+- `nano_client/runs/<ts>/meta.json` exists and `path_meta.total_length_m > 0`
+  with `shape[0] >= 2` after `stop_teach` completes — that's the green light
+  to drive.
 
 ## ZeroMQ wire protocol
 
@@ -259,8 +310,8 @@ Open follow-ups, not yet implemented:
 
 - Reactive emergency-brake using the D435i depth channel (called out in
   [`AGENT.md`](AGENT.md)).
-- Persisting the built `(N, 3)` path to disk on the Nano so an autonomy
-  session can be replayed without re-running `stop_teach`.
+- Replay tool for `autonomy.jsonl` + `path_taught.npy` (plot the reference
+  path against the actual followed poses, compute cross-track-error stats).
 - Teach-mode UI overlay in `streamer.py` (live trajectory preview).
 - Aligning the duplicated Pure Pursuit logic (GPU offline copy in
   [`gpu_server/droideka_src/pure_pursuit.py`](gpu_server/droideka_src/pure_pursuit.py)
