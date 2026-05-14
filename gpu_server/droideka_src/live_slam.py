@@ -9,7 +9,8 @@ Single continuous SLAM session with two states:
 
 ZeroMQ sockets:
 
-* ``tcp://*:5555``  PULL — JPEG frames from the Nano (existing).
+* ``tcp://*:5555``  PULL — JPEG frames: one raw part, or multipart
+  ``[utf8_json, jpeg]`` with ``{"fx","fy","cx","cy"}`` (see README).
 * ``tcp://*:5556``  PUB  — pose stream in AUTONOMOUS state:
                            ``{"x", "y", "theta", "frame_id", "t_ns"}`` (JSON).
 * ``tcp://*:5557``  REP  — command channel. Currently understood commands:
@@ -28,6 +29,8 @@ Environment:
 * ``DROID_SLAM_ROOT``    — root of a DROID-SLAM checkout (adds ``droid_slam/``
                            to ``sys.path`` for the ``droid`` import).
 * ``DROID_SLAM_WEIGHTS`` — optional override for ``--weights``.
+* ``DROIDEKA_INTRINSICS_JSON`` — optional path to ``{"fx","fy","cx","cy"}`` used
+  when frames arrive as **single-part** JPEG (see ``--intrinsics-json``).
 """
 from __future__ import annotations
 
@@ -111,11 +114,119 @@ def get_args():
     parser.add_argument("--pose_port", type=int, default=5556)
     parser.add_argument("--cmd_port", type=int, default=5557)
 
+    # Default pinhole intrinsics when the client sends single-part JPEG only.
+    # Precedence: ``--intrinsics`` > ``--intrinsics-json`` / ``DROIDEKA_INTRINSICS_JSON`` >
+    # built-in default (960×288 pipeline).
+    parser.add_argument(
+        "--intrinsics-json",
+        default=None,
+        help=(
+            "Path to JSON {\"fx\",\"fy\",\"cx\",\"cy\"} for single-part JPEG streams. "
+            "Default: env DROIDEKA_INTRINSICS_JSON if set, else built-in default."
+        ),
+    )
+    parser.add_argument(
+        "--intrinsics",
+        default=None,
+        help="Comma-separated fx,fy,cx,cy (overrides --intrinsics-json when set).",
+    )
+
     # Path-build defaults (overridable per request inside the stop_teach payload)
     parser.add_argument("--min_step_m", type=float, default=0.03)
     parser.add_argument("--smooth_window", type=int, default=7)
 
     return parser.parse_args()
+
+
+_BUILTIN_INTRINSICS_288x960 = (555.3, 552.0, 469.0, 142.2)
+
+
+def _load_fallback_intrinsics_tensor(args: argparse.Namespace) -> torch.Tensor:
+    """Intrinsics used for single-part JPEG or when the wire JSON is invalid."""
+    im_h, im_w = int(args.image_size[0]), int(args.image_size[1])
+
+    if getattr(args, "intrinsics", None):
+        raw = [p.strip() for p in str(args.intrinsics).split(",")]
+        if len(raw) != 4:
+            raise ValueError("--intrinsics expects exactly four comma-separated floats")
+        fx, fy, cx, cy = (float(raw[0]), float(raw[1]), float(raw[2]), float(raw[3]))
+        if not _intrinsics_valid(fx, fy, cx, cy, im_h, im_w):
+            raise ValueError(
+                f"--intrinsics failed bounds check for image_size=({im_h}, {im_w})"
+            )
+        print(f"[intrinsics] using --intrinsics: fx={fx} fy={fy} cx={cx} cy={cy}")
+        return torch.tensor([fx, fy, cx, cy], dtype=torch.float32)
+
+    json_path = (getattr(args, "intrinsics_json", None) or "").strip() or None
+    if not json_path:
+        json_path = os.environ.get("DROIDEKA_INTRINSICS_JSON", "").strip() or None
+
+    if json_path:
+        with open(os.path.abspath(os.path.expanduser(json_path)), encoding="utf-8") as f:
+            d = json.load(f)
+        fx = float(d["fx"])
+        fy = float(d["fy"])
+        cx = float(d["cx"])
+        cy = float(d["cy"])
+        if not _intrinsics_valid(fx, fy, cx, cy, im_h, im_w):
+            raise ValueError(
+                f"intrinsics in {json_path!r} failed bounds check "
+                f"for image_size=({im_h}, {im_w})"
+            )
+        print(
+            f"[intrinsics] loaded {json_path}: fx={fx} fy={fy} cx={cx} cy={cy}"
+        )
+        return torch.tensor([fx, fy, cx, cy], dtype=torch.float32)
+
+    fx, fy, cx, cy = _BUILTIN_INTRINSICS_288x960
+    print(
+        f"[intrinsics] using built-in default (match {im_w}x{im_h} stream / --image_size)"
+    )
+    return torch.tensor([fx, fy, cx, cy], dtype=torch.float32)
+
+
+def _intrinsics_valid(fx: float, fy: float, cx: float, cy: float, im_h: int, im_w: int) -> bool:
+    if fx <= 0.0 or fy <= 0.0 or im_h <= 0 or im_w <= 0:
+        return False
+    margin_x = 0.5 * float(im_w)
+    margin_y = 0.5 * float(im_h)
+    if not (-margin_x <= cx <= float(im_w) + margin_x):
+        return False
+    if not (-margin_y <= cy <= float(im_h) + margin_y):
+        return False
+    return True
+
+
+def _parse_wire_intrinsics_json(
+    raw: bytes, im_h: int, im_w: int
+) -> tuple[float, float, float, float] | None:
+    try:
+        d = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    try:
+        fx = float(d["fx"])
+        fy = float(d["fy"])
+        cx = float(d["cx"])
+        cy = float(d["cy"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not _intrinsics_valid(fx, fy, cx, cy, im_h, im_w):
+        return None
+    return fx, fy, cx, cy
+
+
+def _decode_frames_message(parts: list[bytes]) -> tuple[bytes | None, bytes | None]:
+    """Return ``(jpeg_bytes, intrinsics_json_bytes)``.
+
+    * One part: legacy raw JPEG, no intrinsics sidecar.
+    * Two parts: ``[utf8_json, jpeg_bytes]`` with keys ``fx,fy,cx,cy``.
+    """
+    if len(parts) == 1:
+        return parts[0], None
+    if len(parts) == 2:
+        return parts[1], parts[0]
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +325,7 @@ def _handle_stop_teach(
 
 def main():
     args = get_args()
+    im_h, im_w = int(args.image_size[0]), int(args.image_size[1])
 
     print("Loading DROID-SLAM network onto GPU...")
     droid = Droid(args)
@@ -239,9 +351,8 @@ def main():
         f"pose=PUB:{args.pose_port}  cmd=REP:{args.cmd_port}"
     )
 
-    # Image size used to build the intrinsics: matches --image_size default
-    # 288x960. If you change --image_size, also change these.
-    intrinsics = torch.tensor([555.3, 552.0, 469.0, 142.2])
+    fallback_intrinsics = _load_fallback_intrinsics_tensor(args)
+    last_wire_tuple: tuple[float, float, float, float] | None = None
     frame_id = 0
 
     state = "TEACH"
@@ -314,12 +425,38 @@ def main():
 
             if frames_sock in events:
                 try:
-                    message = frames_sock.recv(flags=zmq.NOBLOCK)
+                    parts = frames_sock.recv_multipart(flags=zmq.NOBLOCK)
                 except zmq.Again:
-                    message = None
+                    parts = None
 
-                if message is not None:
-                    npimg = np.frombuffer(message, dtype=np.uint8)
+                if parts:
+                    jpeg_bytes, meta_bytes = _decode_frames_message(parts)
+                    if jpeg_bytes is None:
+                        print(
+                            f"[frames] expected 1 or 2 ZMQ parts, got {len(parts)}; skipping"
+                        )
+                        continue
+
+                    if meta_bytes is not None:
+                        parsed = _parse_wire_intrinsics_json(meta_bytes, im_h, im_w)
+                        if parsed is None:
+                            print(
+                                "[frames] invalid intrinsics JSON on wire; "
+                                "using fallback intrinsics for this frame"
+                            )
+                            intrinsics = fallback_intrinsics
+                        else:
+                            intrinsics = torch.tensor(parsed, dtype=torch.float32)
+                            if parsed != last_wire_tuple:
+                                fx, fy, cx, cy = parsed
+                                print(
+                                    f"[intrinsics] from wire: fx={fx} fy={fy} cx={cx} cy={cy}"
+                                )
+                                last_wire_tuple = parsed
+                    else:
+                        intrinsics = fallback_intrinsics
+
+                    npimg = np.frombuffer(jpeg_bytes, dtype=np.uint8)
                     frame = cv2.imdecode(npimg, 1)
 
                     if frame is not None:
