@@ -113,8 +113,8 @@ def main() -> int:
     parser.add_argument(
         "--jpeg-quality",
         type=int,
-        default=80,
-        help="JPEG quality (0-100, default: 80).",
+        default=95,
+        help="JPEG quality (0-100, default: 95).",
     )
     args = parser.parse_args()
 
