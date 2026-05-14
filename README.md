@@ -104,6 +104,8 @@ droideka/
 │       └── export_ply.py             # Offline .pth -> coloured .ply (Open3D)
 ├── nano_client/
 │   ├── streamer.py                   # USB camera -> ZMQ PUSH (teach mode)
+│   ├── realsense_streamer.py         # RealSense RGB -> multipart JSON+JPEG + intrinsics
+│   ├── camera_intrinsics.py          # Pinhole scale helper (resize -> new K)
 │   ├── zmq_video_sender.py           # Same wire format, replays KITTI / video
 │   ├── bag_streamer.py               # Same wire format, replays RealSense .bag
 │   ├── extract_bag_frames.py         # Offline: .bag -> JPEG folder (for Nano replay)
@@ -255,12 +257,27 @@ Before arming the buggy:
 
 | Port | Pattern | Direction        | Payload                                                                                                          |
 |------|---------|------------------|------------------------------------------------------------------------------------------------------------------|
-| 5555 | PULL    | Nano → GPU       | Raw JPEG bytes of one frame.                                                                                     |
+| 5555 | PULL    | Nano → GPU       | **Either** a single ZMQ frame: raw JPEG bytes, **or** multipart `[utf8_json, jpeg_bytes]` where `json` is `{"fx","fy","cx","cy"}` pinhole intrinsics for that JPEG (same convention as DROID). `live_slam.py` uses wire intrinsics when present; otherwise `--intrinsics` / `--intrinsics-json` / `DROIDEKA_INTRINSICS_JSON` / built-in default for 960×288. |
 | 5556 | PUB     | GPU → Nano       | UTF-8 JSON: `{"x", "y", "theta", "frame_id", "t_ns"}` (rear-axle pose in SLAM X–Z).                              |
 | 5557 | REP     | Nano → GPU → Nano | Request: UTF-8 JSON `{"cmd": "stop_teach", "min_step_m"?, "smooth_window"?}` or `{"cmd": "ping"}`.<br/>Reply: multipart `[meta_json, payload_bytes]`. On `stop_teach`, `payload_bytes` is a contiguous `(N, 3)` float64 buffer `[x, y, theta]` and `meta_json` has `{"ok", "shape", "dtype", "frame", "yaw_convention", "total_length_m", ...}`. |
 
 The Nano controller picks a `RCVHWM=1` on the pose SUB so it always works on
 the freshest pose and never queues stale ones.
+
+### Camera intrinsics (D435i / DROID)
+
+DROID-SLAM needs `(fx, fy, cx, cy)` in **pixel coordinates for the same
+resolution as the decoded JPEG** (default pipeline: 960×288 width×height on
+the wire, matching `live_slam.py --image_size 288 960` i.e. H×W).
+
+| Source | What to run |
+|--------|-------------|
+| **RealSense SDK on the capture host** | [`nano_client/realsense_streamer.py`](nano_client/realsense_streamer.py) — opens the D435i (or other RS camera), reads factory intrinsics for the active color mode, resizes to `--resize` if needed, and sends multipart JSON+JPEG. Requires `pip install pyrealsense2` (often **not** available as a wheel on Jetson aarch64). |
+| **USB/V4L2 only on the Nano** ([`nano_client/streamer.py`](nano_client/streamer.py)) | Single-part JPEG only. Save a one-time `{"fx","fy","cx","cy"}` file from any machine that has `pyrealsense2` and the same camera (same `--resize`), then on the GPU host run `live_slam.py` with `--intrinsics-json path` or set `DROIDEKA_INTRINSICS_JSON`. Alternatively pass `--intrinsics fx,fy,cx,cy`. |
+| **Bag replay** | [`nano_client/bag_streamer.py`](nano_client/bag_streamer.py) sends multipart with intrinsics from the bag color profile, scaled when `--resize` is used (see [`nano_client/camera_intrinsics.py`](nano_client/camera_intrinsics.py)). |
+
+If you change `--image_size` on the server, change the client output size and
+intrinsics to match.
 
 ## Configuration
 
@@ -289,11 +306,6 @@ Example `my_car.json`:
 
 `target_v` defaults to `0.3 m/s` for the initial live tests — bump it via the
 JSON config once the closed-loop behaviour looks clean.
-
-Camera intrinsics for DROID-SLAM are baked into
-[`gpu_server/droideka_src/live_slam.py`](gpu_server/droideka_src/live_slam.py)
-for the default 960×288 resolution. If you change `--image_size`, also update
-the `intrinsics` tensor in `main()`.
 
 ## Data hygiene
 
