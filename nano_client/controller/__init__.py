@@ -8,5 +8,6 @@ entrypoints.
 
 from .config import VehicleConfig
 from .pure_pursuit import PurePursuit, Pose
+from .teleop import TeleopState
 
-__all__ = ["VehicleConfig", "PurePursuit", "Pose"]
+__all__ = ["VehicleConfig", "PurePursuit", "Pose", "TeleopState"]
