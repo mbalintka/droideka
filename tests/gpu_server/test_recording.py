@@ -1,5 +1,3 @@
-from pathlib import Path
-import pytest
 from gpu_server.droideka_src.recording import record_frame
 
 
@@ -24,3 +22,4 @@ def test_handles_missing_directory_gracefully(tmp_path):
     bad_dir = tmp_path / "no_such_dir"
     # Must not raise even though the directory does not exist.
     record_frame(bad_dir, 1, b"data", active=True)
+    assert not (bad_dir / "000001.jpg").exists()
