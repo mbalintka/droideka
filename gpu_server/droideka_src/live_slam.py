@@ -57,6 +57,8 @@ import argparse
 import json
 import math
 import time
+from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -67,6 +69,7 @@ from lietorch import SE3
 
 from .path_from_reconstruction import build_path_from_poses
 from .pure_pursuit import CAMERA_OFFSET_FORWARD_M, camera_pose_to_vehicle_pose
+from .recording import record_frame
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +137,23 @@ def get_args():
     # Path-build defaults (overridable per request inside the stop_teach payload)
     parser.add_argument("--min_step_m", type=float, default=0.03)
     parser.add_argument("--smooth_window", type=int, default=7)
+
+    # Recording
+    parser.add_argument(
+        "--record-dir",
+        type=Path,
+        default=None,
+        help=(
+            "If set, save every incoming JPEG frame to this directory as "
+            "<frame_id:06d>.jpg. Use --record-teach-only to stop at stop_teach."
+        ),
+    )
+    parser.add_argument(
+        "--record-teach-only",
+        action="store_true",
+        default=False,
+        help="Stop recording when stop_teach is received (default: record always).",
+    )
 
     return parser.parse_args()
 
@@ -327,6 +347,20 @@ def main():
     args = get_args()
     im_h, im_w = int(args.image_size[0]), int(args.image_size[1])
 
+    record_dir: Optional[Path] = None
+    recording_active: bool = False
+    if args.record_dir is not None:
+        record_dir = Path(args.record_dir)
+        if not record_dir.parent.exists():
+            print(
+                f"ERROR: parent of --record-dir does not exist: {record_dir.parent}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        record_dir.mkdir(parents=True, exist_ok=True)
+        recording_active = True
+        print(f"[record] saving frames to {record_dir}")
+
     print("Loading DROID-SLAM network onto GPU...")
     droid = Droid(args)
     print("DROID-SLAM ready.")
@@ -404,6 +438,12 @@ def main():
                                 f"State: {state} — publishing live pose on "
                                 f":{args.pose_port}."
                             )
+                            if args.record_teach_only and recording_active:
+                                recording_active = False
+                                print(
+                                    f"[record] stopped at frame {frame_id} "
+                                    "(teach-only mode)"
+                                )
                         except Exception as e:
                             err = {"ok": False, "error": str(e)}
                             _cmd_reply(json.dumps(err).encode("utf-8"), b"")
@@ -460,6 +500,10 @@ def main():
                     frame = cv2.imdecode(npimg, 1)
 
                     if frame is not None:
+                        # --- recording tee (before SLAM track) ---
+                        record_frame(record_dir, frame_id, jpeg_bytes, recording_active)
+                        # --- end recording tee ---
+
                         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         image_tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).float()
                         image_tensor = image_tensor.unsqueeze(0)
