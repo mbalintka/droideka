@@ -109,3 +109,6 @@ artifacts/
 
 # Allow keeping empty dirs in git
 !.gitkeep
+
+# Git worktrees (local isolated workspaces)
+.worktrees/
