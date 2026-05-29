@@ -46,6 +46,7 @@ def start_streaming(
     port: int,
     resize: tuple[int, int],
     jpeg_quality: int,
+    rate_hz: float,
 ) -> None:
     try:
         import pyrealsense2 as rs  # type: ignore[import-not-found]
@@ -119,6 +120,12 @@ def start_streaming(
         {"fx": fx, "fy": fy, "cx": cx, "cy": cy}, separators=(",", ":")
     ).encode("utf-8")
 
+    delay_s = 1.0 / max(rate_hz, 1e-6) if rate_hz > 0.0 else 0.0
+    if delay_s > 0.0:
+        print(f"Outgoing frame rate capped at {rate_hz:.1f} Hz ({delay_s * 1000:.0f} ms between sends).")
+    else:
+        print("Outgoing frame rate uncapped (sending as fast as the camera delivers).")
+
     frame_count = 0
     start_time = time.time()
 
@@ -152,6 +159,9 @@ def start_streaming(
                     f"Sent: {frame_count} frames | FPS: {fps:.1f} | "
                     f"Size: {size_kb:.1f} KB"
                 )
+
+            if delay_s > 0.0:
+                time.sleep(delay_s)
 
     except KeyboardInterrupt:
         print("\nStreaming stopped by user.")
@@ -198,6 +208,15 @@ def main() -> int:
         default=95,
         help="JPEG quality (0-100, default: 95).",
     )
+    parser.add_argument(
+        "--rate-hz",
+        type=float,
+        default=10.0,
+        help=(
+            "Outgoing frame rate cap in Hz; 0 means send as fast as the camera "
+            "delivers (default: 10, matching typical DROID-SLAM throughput)."
+        ),
+    )
     args = parser.parse_args()
 
     if "x" not in args.resize.lower():
@@ -210,6 +229,7 @@ def main() -> int:
         port=args.port,
         resize=resize,
         jpeg_quality=args.jpeg_quality,
+        rate_hz=args.rate_hz,
     )
     return 0
 
