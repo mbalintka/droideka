@@ -20,6 +20,7 @@ Example::
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -28,6 +29,8 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 import zmq
+
+from camera_intrinsics import scale_pinhole_intrinsics
 
 
 def _try_int(value: Optional[str]) -> Optional[int]:
@@ -54,6 +57,33 @@ def _encode_jpeg(frame_bgr: np.ndarray, quality: int) -> bytes:
     if not success:
         raise RuntimeError("cv2.imencode(.jpg) failed")
     return buffer.tobytes()
+
+
+def _to_bgr(raw: np.ndarray, fmt: "object") -> np.ndarray:
+    """Convert a RealSense color frame buffer to OpenCV-friendly BGR8.
+
+    ``fmt`` is the ``rs.format`` of the source frame. We only handle the color
+    formats the D435i can actually emit; anything else raises so the caller
+    sees a real error instead of a silently wrong frame.
+    """
+    # pyrealsense2 is imported lazily inside the caller, so do the same here.
+    import pyrealsense2 as rs  # type: ignore[import-not-found]
+
+    if fmt == rs.format.bgr8:
+        return raw
+    if fmt == rs.format.rgb8:
+        return cv2.cvtColor(raw, cv2.COLOR_RGB2BGR)
+    if fmt == rs.format.bgra8:
+        return cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
+    if fmt == rs.format.rgba8:
+        return cv2.cvtColor(raw, cv2.COLOR_RGBA2BGR)
+    if fmt == rs.format.yuyv:
+        return cv2.cvtColor(raw, cv2.COLOR_YUV2BGR_YUYV)
+    if fmt == rs.format.uyvy:
+        return cv2.cvtColor(raw, cv2.COLOR_YUV2BGR_UYVY)
+    if fmt == rs.format.y8:
+        return cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
+    raise RuntimeError(f"Unsupported RealSense color format for replay: {fmt}")
 
 
 def stream_bag(
@@ -97,10 +127,16 @@ def stream_bag(
 
     # Non-real-time playback so we never silently drop frames while the GPU is
     # busy with a heavy DROID-SLAM iteration. We do our own pacing below.
+    #
+    # NOTE: we deliberately do NOT pin the color format here. The RealSense
+    # device almost never records in BGR8 — it's typically YUYV or RGB8 — so
+    # constraining the format upfront makes pipeline.start() fail with the
+    # opaque "Couldn't resolve requests" error. We accept whatever the bag has
+    # and convert to BGR after the fact (see _to_bgr below).
     pipeline = rs.pipeline()
     cfg = rs.config()
     cfg.enable_device_from_file(bag_path, repeat_playback=False)
-    cfg.enable_stream(rs.stream.color, rs.format.bgr8, 0)
+    cfg.enable_all_streams()
 
     try:
         profile = pipeline.start(cfg)
@@ -112,12 +148,49 @@ def stream_bag(
     playback = profile.get_device().as_playback()
     playback.set_real_time(False)
 
-    color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
+    # Find the color video stream in the bag (it may have depth / IR too).
+    color_profile = None
+    stream_names = []
+    for sp in profile.get_streams():
+        stream_names.append(sp.stream_name())
+        if sp.stream_type() == rs.stream.color:
+            color_profile = sp.as_video_stream_profile()
+
+    if color_profile is None:
+        print(
+            f"ERROR: bag has no color stream. Streams in file: {stream_names}",
+            file=sys.stderr,
+        )
+        try:
+            pipeline.stop()
+        finally:
+            socket.close(linger=0)
+        return 2
+
     src_w, src_h = color_profile.width(), color_profile.height()
+    src_fmt = color_profile.format()
     print(
         f"Bag opened: color={src_w}x{src_h} @ {color_profile.fps()} FPS "
-        f"({color_profile.format()})."
+        f"({src_fmt}). Streams in file: {stream_names}"
     )
+
+    intr = color_profile.get_intrinsics()
+    fx, fy, cx, cy = float(intr.fx), float(intr.fy), float(intr.ppx), float(intr.ppy)
+    if resize is not None:
+        dst_w, dst_h = resize
+        fx, fy, cx, cy = scale_pinhole_intrinsics(
+            fx, fy, cx, cy, (src_w, src_h), (dst_w, dst_h)
+        )
+        print(
+            f"Intrinsics scaled for resize {src_w}x{src_h} -> {dst_w}x{dst_h}: "
+            f"fx={fx:.4f} fy={fy:.4f} cx={cx:.4f} cy={cy:.4f}"
+        )
+    else:
+        print(f"Intrinsics at bag resolution: fx={fx:.4f} fy={fy:.4f} cx={cx:.4f} cy={cy:.4f}")
+
+    intrinsics_json = json.dumps(
+        {"fx": fx, "fy": fy, "cx": cx, "cy": cy}, separators=(",", ":")
+    ).encode("utf-8")
 
     delay_s = 1.0 / max(rate_hz, 1e-6) if rate_hz > 0.0 else 0.0
     sent = 0
@@ -140,9 +213,17 @@ def stream_bag(
             if skip_frames > 0 and (read - 1) % (skip_frames + 1) != 0:
                 continue
 
-            frame = np.asanyarray(color.get_data())
-            if frame is None or frame.size == 0:
+            raw = np.asanyarray(color.get_data())
+            if raw is None or raw.size == 0:
                 continue
+
+            try:
+                frame = _to_bgr(raw, src_fmt)
+            except RuntimeError as e:
+                # Surface this loudly and stop — the rest of the bag will fail
+                # the same way and we don't want to flood the GPU with garbage.
+                print(f"ERROR: {e}", file=sys.stderr)
+                break
 
             if resize is not None:
                 frame = cv2.resize(frame, resize)
@@ -153,7 +234,7 @@ def stream_bag(
                 print(f"WARNING: JPEG encode failed on frame {read}: {e}")
                 continue
 
-            socket.send(payload)
+            socket.send_multipart([intrinsics_json, payload])
             sent += 1
 
             now = time.time()
@@ -194,7 +275,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Replay the color stream of a RealSense .bag as JPEG frames over "
-            "ZeroMQ PUSH, matching the wire format expected by live_slam.py."
+            "ZeroMQ PUSH. Sends multipart [intrinsics_json, jpeg] for "
+            "gpu_server/droideka_src/live_slam.py."
         ),
     )
     parser.add_argument(
@@ -217,15 +299,16 @@ def main() -> int:
         "--resize",
         default="960x288",
         help=(
-            "Resize WIDTHxHEIGHT before JPEG encoding (default: 960x288 to match "
-            "the intrinsics baked into live_slam.py). Use 'none' to disable."
+            "Resize WIDTHxHEIGHT before JPEG encoding (default: 960x288). "
+            "Pinhole intrinsics are read from the bag and scaled to match. "
+            "Use 'none' to keep the bag's native resolution."
         ),
     )
     parser.add_argument(
         "--jpeg-quality",
         type=int,
-        default=80,
-        help="JPEG quality 0-100 (default: 80).",
+        default=95,
+        help="JPEG quality 0-100 (default: 95).",
     )
     parser.add_argument(
         "--rate-hz",
