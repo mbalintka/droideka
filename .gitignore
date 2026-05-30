@@ -107,6 +107,7 @@ outputs/
 results/
 artifacts/
 bag_frames/
+nano_client/2011_09_26/
 
 # Local docs / thesis / AI notes (not part of the shipped codebase)
 docs/
