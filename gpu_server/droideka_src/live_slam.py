@@ -91,7 +91,17 @@ def _default_weights_path() -> str:
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", default=_default_weights_path())
-    parser.add_argument("--buffer", type=int, default=512)
+    parser.add_argument(
+        "--buffer",
+        type=int,
+        default=512,
+        help=(
+            "Max keyframes in GPU ring buffer (DROID-SLAM DepthVideo size). "
+            "On a 12 GB GPU use 512–768 for teach; 2048 pre-allocates ~10 GB "
+            "at 288×960 and leaves no headroom for tracking or global BA. "
+            "Each 512 slots reserve ~2.5 GB VRAM at 288×960."
+        ),
+    )
     parser.add_argument("--image_size", nargs="+", type=int, default=[288, 960])
     parser.add_argument("--disable_vis", action="store_true", default=True)
     parser.add_argument("--stereo", action="store_true")
@@ -153,6 +163,36 @@ def get_args():
         action="store_true",
         default=False,
         help="Stop recording when stop_teach is received (default: record always).",
+    )
+
+    parser.add_argument(
+        "--skip-terminate",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip global bundle adjustment on shutdown. Frontend poses/disps "
+            "are exported directly (recommended for ≤12 GB GPUs or when "
+            "--buffer is large)."
+        ),
+    )
+    parser.add_argument(
+        "--no-auto-skip-terminate",
+        action="store_true",
+        default=False,
+        help=(
+            "Always attempt global BA on shutdown even when free VRAM is low. "
+            "Default: auto-skip when headroom is insufficient."
+        ),
+    )
+    parser.add_argument(
+        "--terminate-max-keyframes",
+        type=int,
+        default=768,
+        help=(
+            "Auto-skip global BA when keyframe count exceeds this limit "
+            "(default: 768). DROID backend allocates ~16× keyframes worth "
+            "of GPU memory and can OOM on consumer GPUs."
+        ),
     )
 
     return parser.parse_args()
@@ -254,14 +294,19 @@ def _decode_frames_message(parts: list[bytes]) -> tuple[bytes | None, bytes | No
 # ---------------------------------------------------------------------------
 
 
-def _latest_rear_axle_pose(droid) -> tuple[float, float, float, int] | None:
+def _keyframe_count(droid, buffer_size: int) -> int:
+    """Clamp keyframe count to the allocated DepthVideo buffer."""
+    return min(int(droid.video.counter.value), buffer_size)
+
+
+def _latest_rear_axle_pose(droid, buffer_size: int) -> tuple[float, float, float, int] | None:
     """Return the most recent rear-axle pose ``(x, y, theta, frame_id)``.
 
     ``x`` and ``y`` are the SLAM X / Z coordinates (Y / vertical dropped),
     ``theta`` is the heading in the X–Z plane (0 along +X, CCW positive).
     Returns ``None`` if no pose has been added to the SLAM video yet.
     """
-    t = int(droid.video.counter.value)
+    t = _keyframe_count(droid, buffer_size)
     if t <= 0:
         return None
 
@@ -294,13 +339,14 @@ def _handle_stop_teach(
     payload: dict,
     default_min_step_m: float,
     default_smooth_window: int,
+    buffer_size: int,
 ) -> tuple[np.ndarray, dict]:
     """Build the (N,3) [x,y,theta] path from the current SLAM buffer.
 
     Returns ``(path_xyz_theta, meta)``. ``meta`` is the JSON-serialisable
     dict that will be sent as the first frame of the multipart reply.
     """
-    t = int(droid.video.counter.value)
+    t = _keyframe_count(droid, buffer_size)
     if t < 2:
         raise RuntimeError(
             f"Cannot build path: only {t} keyframe(s) accumulated so far."
@@ -338,6 +384,130 @@ def _handle_stop_teach(
     return path_xy_theta, meta
 
 
+# Minimum free VRAM (GiB) needed for frontend correlation volumes / backend BA.
+_MIN_TRACK_HEADROOM_GIB = 1.5
+_MIN_TERMINATE_HEADROOM_GIB = 0.75
+
+
+def _estimate_depth_video_gib(im_h: int, im_w: int, buffer: int, stereo: bool) -> float:
+    """Upper-bound VRAM for the pre-allocated DepthVideo ring buffer."""
+    ht8, wd8 = im_h // 8, im_w // 8
+    c = 2 if stereo else 1
+    bytes_per_slot = (
+        3 * im_h * im_w  # images (uint8)
+        + 2 * ht8 * wd8 * 4  # disps + disps_sens (float32)
+        + im_h * im_w * 4  # disps_up (float32)
+        + c * 128 * ht8 * wd8 * 2  # fmaps (float16)
+        + 2 * 128 * ht8 * wd8 * 2  # nets + inps (float16)
+        + 64  # poses, intrinsics, flags (negligible)
+    )
+    return buffer * bytes_per_slot / (1024**3)
+
+
+def _gpu_mem_gib() -> tuple[float, float]:
+    """Return (free_gib, total_gib) for the current CUDA device."""
+    free_b, total_b = torch.cuda.mem_get_info()
+    return free_b / (1024**3), total_b / (1024**3)
+
+
+def _warn_buffer_vram(args: argparse.Namespace) -> None:
+    """Print VRAM estimate after Droid init; warn when headroom is tight."""
+    im_h, im_w = int(args.image_size[0]), int(args.image_size[1])
+    est_gib = _estimate_depth_video_gib(im_h, im_w, args.buffer, args.stereo)
+    free_gib, total_gib = _gpu_mem_gib()
+    print(
+        f"[vram] DepthVideo buffer ({args.buffer} slots @ {im_w}x{im_h}): "
+        f"~{est_gib:.1f} GiB reserved  |  GPU free {free_gib:.1f}/{total_gib:.1f} GiB"
+    )
+    if free_gib < _MIN_TRACK_HEADROOM_GIB:
+        # Recommend a buffer that leaves ~2.5 GiB for the network + factor graph.
+        target_gib = max(total_gib - 2.5, 1.0)
+        per_slot_gib = _estimate_depth_video_gib(im_h, im_w, 1, args.stereo)
+        suggested = max(128, int(target_gib / per_slot_gib))
+        suggested = min(suggested, args.buffer)
+        print(
+            f"[vram] WARNING: only {free_gib:.1f} GiB free — tracking may OOM "
+            f"(needs ~{_MIN_TRACK_HEADROOM_GIB:.1f} GiB headroom).\n"
+            f"[vram] On this GPU try --buffer {suggested} (or add --skip-terminate). "
+            f"Current --buffer {args.buffer} pre-allocates almost all VRAM."
+        )
+    elif not args.skip_terminate and free_gib < _MIN_TERMINATE_HEADROOM_GIB + 1.0:
+        print(
+            "[vram] Low headroom for global BA on shutdown — "
+            "will auto-skip terminate unless --no-auto-skip-terminate is set."
+        )
+
+
+def _track_frame(droid, frame_id: int, image_tensor: torch.Tensor, intrinsics: torch.Tensor) -> None:
+    """Run droid.track with one OOM recovery attempt (empty_cache + retry)."""
+    try:
+        droid.track(frame_id, image_tensor, intrinsics=intrinsics)
+    except RuntimeError as e:
+        if "out of memory" not in str(e).lower():
+            raise
+        torch.cuda.empty_cache()
+        try:
+            droid.track(frame_id, image_tensor, intrinsics=intrinsics)
+        except RuntimeError:
+            raise e from None
+
+
+def _release_frontend(droid) -> None:
+    """Free frontend / factor-graph state before map export."""
+    if getattr(droid, "frontend", None) is not None:
+        del droid.frontend
+        droid.frontend = None
+        torch.cuda.empty_cache()
+
+
+def _run_termination_ba(droid, args: argparse.Namespace) -> None:
+    """Optional global bundle adjustment before map export."""
+    t = _keyframe_count(droid, args.buffer)
+
+    if args.skip_terminate:
+        print(
+            "[terminate] skipped global BA (--skip-terminate). "
+            "Exporting frontend poses/disps."
+        )
+        _release_frontend(droid)
+        return
+
+    if not args.no_auto_skip_terminate:
+        free_gib, _ = _gpu_mem_gib()
+        if free_gib < _MIN_TERMINATE_HEADROOM_GIB:
+            print(
+                f"[terminate] skipped global BA ({free_gib:.2f} GiB free < "
+                f"{_MIN_TERMINATE_HEADROOM_GIB:.2f} GiB needed). "
+                "Exporting frontend poses/disps; map export is unaffected."
+            )
+            _release_frontend(droid)
+            return
+
+    if t > args.terminate_max_keyframes:
+        print(
+            f"[terminate] skipped global BA ({t} keyframes > "
+            f"limit {args.terminate_max_keyframes}). "
+            "Exporting frontend poses/disps; map quality is usually fine."
+        )
+        _release_frontend(droid)
+        return
+
+    print("[terminate] running global bundle adjustment...")
+    try:
+        droid.terminate()
+    except RuntimeError as e:
+        err = str(e).lower()
+        if "out of memory" in err:
+            print(
+                f"[terminate] global BA OOM: {e}\n"
+                "[terminate] continuing with frontend poses/disps "
+                "(map export is unaffected)."
+            )
+            _release_frontend(droid)
+            return
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -364,6 +534,7 @@ def main():
     print("Loading DROID-SLAM network onto GPU...")
     droid = Droid(args)
     print("DROID-SLAM ready.")
+    _warn_buffer_vram(args)
 
     context = zmq.Context.instance()
 
@@ -428,6 +599,7 @@ def main():
                                 payload,
                                 args.min_step_m,
                                 args.smooth_window,
+                                args.buffer,
                             )
                             _cmd_reply(
                                 json.dumps(meta).encode("utf-8"),
@@ -508,8 +680,33 @@ def main():
                         image_tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).float()
                         image_tensor = image_tensor.unsqueeze(0)
 
+                        kf_count = int(droid.video.counter.value)
+                        if kf_count >= args.buffer:
+                            if frame_id % 50 == 0:
+                                print(
+                                    f"[track] keyframe buffer full "
+                                    f"({kf_count}/{args.buffer}). "
+                                    "Send stop_teach or restart with a larger "
+                                    "--buffer. SLAM updates skipped; CUDA may "
+                                    "already be unusable if asserts appeared."
+                                )
+                            frame_id += 1
+                            continue
+
+                        if (
+                            kf_count >= int(0.9 * args.buffer)
+                            and frame_id % 100 == 0
+                        ):
+                            print(
+                                f"[track] keyframe buffer "
+                                f"{kf_count}/{args.buffer} "
+                                f"({100 * kf_count // args.buffer}%) — "
+                                "approaching limit; send stop_teach soon or "
+                                "restart with --buffer <N>."
+                            )
+
                         try:
-                            droid.track(frame_id, image_tensor, intrinsics=intrinsics)
+                            _track_frame(droid, frame_id, image_tensor, intrinsics)
                         except Exception as e:
                             print(f"[track] frame {frame_id} failed: {e}")
                             frame_id += 1
@@ -518,13 +715,14 @@ def main():
                         if frame_id % 10 == 0:
                             print(
                                 f"[{state}] tracked frame {frame_id} "
-                                f"(keyframes: {int(droid.video.counter.value)})"
+                                f"(keyframes: {int(droid.video.counter.value)}"
+                                f"/{args.buffer})"
                             )
                         frame_id += 1
 
                         if state == "AUTONOMOUS":
                             try:
-                                pose = _latest_rear_axle_pose(droid)
+                                pose = _latest_rear_axle_pose(droid, args.buffer)
                             except Exception as e:
                                 pose = None
                                 print(f"[pose] extract failed: {e}")
@@ -546,25 +744,36 @@ def main():
                                     pass
 
     except KeyboardInterrupt:
-        print("\nInterrupted. Finalising 3D map (Bundle Adjustment)...")
+        print("\nInterrupted. Finalising 3D map...")
     finally:
         if frame_id > 0:
             print("Please wait, this may take 1-2 minutes...")
             try:
-                droid.terminate()
+                _run_termination_ba(droid, args)
             except Exception as e:
                 print(f"Termination optimisation error: {e}")
+                _release_frontend(droid)
 
             print("Extracting 3D data from GPU memory...")
-            t = droid.video.counter.value
-            map_data = {
-                "images": droid.video.images[:t].cpu().numpy(),
-                "disps": droid.video.disps_up[:t].cpu().numpy(),
-                "poses": droid.video.poses[:t].cpu().numpy(),
-                "intrinsics": droid.video.intrinsics[:t].cpu().numpy(),
-            }
-            torch.save(map_data, args.reconstruction_path)
-            print(f"Map saved to: {args.reconstruction_path}")
+            t = _keyframe_count(droid, args.buffer)
+            try:
+                map_data = {
+                    "images": droid.video.images[:t].cpu().numpy(),
+                    # Native 1/8 disparities (always updated during tracking).
+                    "disps": droid.video.disps[:t].cpu().numpy(),
+                    # Full-res upsampled maps (optional, may be sparse before BA).
+                    "disps_up": droid.video.disps_up[:t].cpu().numpy(),
+                    "poses": droid.video.poses[:t].cpu().numpy(),
+                    "intrinsics": droid.video.intrinsics[:t].cpu().numpy(),
+                }
+                torch.save(map_data, args.reconstruction_path)
+                print(f"Map saved to: {args.reconstruction_path} ({t} keyframes)")
+            except RuntimeError as e:
+                print(
+                    f"Could not extract map ({t} keyframes): {e}\n"
+                    "If you saw CUDA device-side asserts, restart the process "
+                    "with a larger --buffer before the buffer fills."
+                )
 
         try:
             pose_sock.close(linger=0)

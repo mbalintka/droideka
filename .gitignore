@@ -106,6 +106,13 @@ captures/
 outputs/
 results/
 artifacts/
+bag_frames/
+
+# Local docs / thesis / AI notes (not part of the shipped codebase)
+docs/
+documentation/
+.cursorrules
+AGENT.md
 
 # Allow keeping empty dirs in git
 !.gitkeep

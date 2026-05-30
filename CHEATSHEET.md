@@ -1,12 +1,137 @@
 # droideka live-test cheat sheet
 
-One page, top-to-bottom. Open six terminals (GPU server / `car_control_node`
-/ WASD teleop / camera streamer / `ping` probe / autonomy) and walk down
-in order. The **camera streamer** in step 4 is usually the Nano for USB
-(`streamer.py`); for `realsense_streamer.py` use any machine with
-`pyrealsense2` and the D435i on USB (often a laptop on the same LAN as the
-GPU). Every command assumes you've `cd`'d into the relevant repo root
-and that `<gpu>` is the GPU server's IP/hostname.
+One page, top-to-bottom. Every command assumes you've `cd`'d into the
+relevant repo root and that `<gpu>` is the GPU server's IP/hostname.
+
+---
+
+## End-to-end workflow (quick path)
+
+Six terminals, in order. Covers **camera intrinsics**, **manual teach**,
+**autonomous follow**, and **video capture**.
+
+| Step | Terminal | Host | What to run |
+|------|----------|------|-------------|
+| 1 | T1 | GPU | `live_slam` (+ intrinsics if needed) + `--record-dir` |
+| 2 | T2 | Nano | `ros2 run car_control car_control_node` |
+| 3 | T3 | Nano | `python -m nano_client.controller.teleop` |
+| 4 | T4 | Nano or laptop | Camera streamer → `<gpu>:5555` |
+| 5 | T5 | any | `ping` the GPU (sanity check) |
+| 6 | T3→T6 | Nano | Teach route with WASD, kill teleop, start autonomy |
+| 7 | T1 | GPU | `make_video` on the recorded frames (optional) |
+
+### 1 — GPU: SLAM + frame recording (T1)
+
+```bash
+cd gpu_server
+export DROID_SLAM_ROOT=/balint/droideka/DROID-SLAM DROID_SLAM_WEIGHTS=$DROID_SLAM_ROOT/droid.pth   # once per shell
+
+# Pick ONE intrinsics path (see table below), then start SLAM:
+python -m droideka_src.live_slam \
+    --record-dir runs/$(date +%Y%m%d_%H%M%S)/frames
+```
+
+**Intrinsics — pick one source:**
+
+| Camera setup | Streamer (step 4) | GPU `live_slam` flags |
+|--------------|-------------------|------------------------|
+| Intel RealSense D435i | `realsense_streamer.py` | None — fx/fy/cx/cy arrive on the wire |
+| Jetson USB / V4L2 | `streamer.py` | `--intrinsics-json path/to/intrinsics.json` **or** `export DROIDEKA_INTRINSICS_JSON=...` **or** `--intrinsics fx,fy,cx,cy` |
+| Replay saved JPEGs later | `zmq_video_sender.py` | Same JSON/CLI flags as V4L2 |
+
+Example with a calibration file (960×288 stream):
+
+```bash
+python -m droideka_src.live_slam \
+    --intrinsics-json path/to/intrinsics.json \
+    --record-dir runs/$(date +%Y%m%d_%H%M%S)/frames
+```
+
+Wait for: `Sockets bound: frames=PULL:5555 ...` and `State: TEACH`.
+
+### 2 — Nano: arm motors (T2)
+
+```bash
+# source ROS 2 + auto_control_ws overlay first
+ros2 run car_control car_control_node
+```
+
+### 3 — Nano: manual driving (T3)
+
+```bash
+cd /path/to/droideka
+python -m nano_client.controller.teleop
+```
+
+WASD + Space stop. **Kill this terminal before autonomy** (step 6).
+
+### 4 — Camera feed to GPU (T4)
+
+Pick **one** streamer; output must be **960×288** JPEG on port **5555** (match
+`live_slam --image_size 288 960`).
+
+```bash
+# USB on Jetson (no intrinsics on wire — you set them in step 1):
+python nano_client/streamer.py --server-ip <gpu>
+
+# RealSense on a host with pyrealsense2 (intrinsics on wire — step 1 needs no flags):
+python nano_client/realsense_streamer.py --server-ip <gpu> --resize 960x288
+```
+
+Confirm: streamer prints ~30 FPS; GPU shows `[TEACH] tracked frame N`.
+
+### 5 — Sanity check (T5)
+
+```bash
+python -c "import zmq, json; \
+s = zmq.Context().socket(zmq.REQ); s.connect('tcp://<gpu>:5557'); \
+s.send_string(json.dumps({'cmd':'ping'})); print(s.recv_multipart())"
+```
+
+Expect `"state": "TEACH"` and `"frames"` increasing.
+
+### 6 — Teach, then autonomy (T3 → T6)
+
+**Teach (T3 + T4 still running):**
+
+1. Drive the route with WASD at gentle speed. **Do not lift the car** between
+   teach and autonomy.
+2. Return to your intended **start pose** and Space-stop.
+3. Ctrl+C **teleop** (T3). Leave **streamer** (T4) running.
+
+**Autonomy (new T6):**
+
+```bash
+python -m nano_client.controller.node --gpu-host <gpu>
+```
+
+This sends `stop_teach` to the GPU, saves `path_taught.npy`, and follows the
+taught path. Watch for `Publishing /cmd_vel at 30.0 Hz`.
+
+### 7 — Video from captured frames (GPU, after the run)
+
+```bash
+cd gpu_server
+python -m droideka_src.make_video \
+    --frames-dir runs/<stamp>/frames \
+    --output     runs/<stamp>/teach_run.mp4 \
+    --fps        10
+```
+
+Frames are written during teach **and** autonomy unless you add
+`--record-teach-only` to step 1.
+
+### Shutdown (reverse order)
+
+Autonomy node → streamer → `car_control_node` → `live_slam` (wait 1–2 min for
+bundle adjustment).
+
+---
+
+## Detailed steps
+
+The sections below expand each step (extra flags, route patterns, artefacts,
+emergency stops).
 
 ---
 
@@ -180,7 +305,7 @@ CRITICAL: **do not pick up the car between teach and autonomy.** SLAM is
 one continuous session — physically teleporting the car would corrupt the
 world frame and either confuse the tracker or get rejected as a tracking
 failure. The car's location at the moment you launch the autonomy node
-in step 8 **is** the start of the autonomous follow.
+in step 7 **is** the start of the autonomous follow.
 
 Pick a route shape that matches what you want autonomy to do:
 
@@ -213,31 +338,7 @@ When you're happy with the route:
 
 ---
 
-## 7. Post-run — stitch recorded frames into video (GPU box, optional)
-
-```bash
-cd gpu_server
-python -m droideka_src.make_video \
-    --frames-dir runs/<stamp>/frames \
-    --output     runs/<stamp>/teach_run.mp4 \
-    --fps        10
-```
-
-The resulting `teach_run.mp4` can be opened in any video player. The raw
-frames in `runs/<stamp>/frames/` can also be replayed into DROID-SLAM:
-
-```bash
-# From droideka repo root:
-python -m nano_client.zmq_video_sender \
-    --server-ip <gpu> \
-    --source "runs/<stamp>/frames/*.jpg"
-# Provide intrinsics if recorded from a USB/V4L2 camera (not RealSense):
-#   live_slam.py --intrinsics-json path/to/intrinsics.json
-```
-
----
-
-## 8. Hand off to autonomy (Terminal 6, Nano)
+## 7. Hand off to autonomy (Terminal 6, Nano)
 
 ```bash
 python -m nano_client.controller.node --gpu-host <gpu>
@@ -269,7 +370,7 @@ process or yank the battery if anything looks off.
 
 ---
 
-## 9. During autonomy — what to watch
+## 8. During autonomy — what to watch
 
 - **GPU terminal**: `[AUTONOMOUS] tracked frame N` lines keep climbing.
 - **Autonomy terminal**: occasional `pose stale` warnings are OK in
@@ -283,7 +384,7 @@ restart.
 
 ---
 
-## 10. Shut down (in reverse order)
+## 9. Shut down (in reverse order)
 
 1. Ctrl+C the **autonomy node** (Terminal 6). It will publish a final
    stop Twist and write a `shutdown` record to `autonomy.jsonl`.
@@ -294,9 +395,36 @@ restart.
 
 ---
 
+## 10. Post-run — stitch recorded frames into video (GPU box, optional)
+
+After shutdown (section 9), turn the JPEGs saved by `--record-dir` in step 1
+into an MP4:
+
+```bash
+cd gpu_server
+python -m droideka_src.make_video \
+    --frames-dir runs/<stamp>/frames \
+    --output     runs/<stamp>/teach_run.mp4 \
+    --fps        10
+```
+
+The resulting `teach_run.mp4` can be opened in any video player. The raw
+frames in `runs/<stamp>/frames/` can also be replayed into DROID-SLAM:
+
+```bash
+# From droideka repo root:
+python -m nano_client.zmq_video_sender \
+    --server-ip <gpu> \
+    --source "runs/<stamp>/frames/*.jpg"
+# Provide intrinsics if recorded from a USB/V4L2 camera (not RealSense):
+#   live_slam.py --intrinsics-json path/to/intrinsics.json
+```
+
+---
+
 ## 11. Collect artefacts
 
-Per-run bundle from step 8.2:
+Per-run bundle from step 7:
 
 ```
 nano_client/runs/<YYYYMMDD_HHMMSS>/
